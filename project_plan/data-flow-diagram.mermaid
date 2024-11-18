@@ -1,0 +1,36 @@
+sequenceDiagram
+    participant User
+    participant Frontend
+    participant API
+    participant Queue
+    participant Worker
+    participant ATProtocol
+    participant DB
+
+    User->>Frontend: Initialize Analysis
+    Frontend->>API: POST /analysis/start
+    API->>Queue: Create Analysis Job
+    Queue->>Worker: Process Job
+    
+    par Data Collection
+        Worker->>ATProtocol: Get Follows
+        ATProtocol-->>Worker: Follows Data
+        Worker->>ATProtocol: Get Followers
+        ATProtocol-->>Worker: Followers Data
+    end
+
+    Worker->>Worker: Find Mutual Connections
+    
+    loop For Each Mutual
+        Worker->>ATProtocol: Get Connection Data
+        ATProtocol-->>Worker: Connection Data
+        Worker->>Worker: Process Connection
+        Worker->>DB: Store Progress
+        Worker->>Frontend: Send Progress Update
+    end
+
+    Worker->>Worker: Detect Communities
+    Worker->>DB: Store Results
+    DB-->>API: Results Ready
+    API-->>Frontend: Analysis Complete
+    Frontend->>User: Show Visualization

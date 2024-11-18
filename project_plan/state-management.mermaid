@@ -1,0 +1,21 @@
+stateDiagram-v2
+    [*] --> Initializing
+    Initializing --> Authenticating: User Provides Credentials
+    
+    Authenticating --> Error: Auth Failed
+    Authenticating --> CollectingData: Auth Success
+    
+    CollectingData --> ProcessingData: Data Collected
+    CollectingData --> Error: Collection Failed
+    
+    ProcessingData --> RenderingVisualization: Processing Complete
+    ProcessingData --> Error: Processing Failed
+    
+    RenderingVisualization --> Interactive: Render Complete
+    
+    Interactive --> Updating: User Interaction
+    Updating --> Interactive: Update Complete
+    
+    Error --> Initializing: Retry
+    
+    Interactive --> [*]: Close Application

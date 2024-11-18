@@ -1,0 +1,30 @@
+flowchart TB
+    subgraph DataCollection["1. Data Collection"]
+        A[Fetch User Profile] --> B[Get Follows]
+        B --> C[Get Followers]
+        C --> D[Identify Mutuals]
+    end
+
+    subgraph GraphProcessing["2. Graph Processing"]
+        E[Create Graph Structure] --> F[Calculate Node Positions]
+        F --> G[Detect Communities]
+        G --> H[Calculate Metrics]
+    end
+
+    subgraph Visualization["3. Visualization"]
+        I[Initialize Scene] --> J[Create Geometries]
+        J --> K[Apply Layout]
+        K --> L[Setup Interactions]
+    end
+
+    D --> E
+    H --> I
+
+    subgraph StatusUpdates["Progress Updates"]
+        M[Collection Progress] --> N[Processing Status]
+        N --> O[Render Status]
+    end
+
+    B --> M
+    F --> N
+    J --> O

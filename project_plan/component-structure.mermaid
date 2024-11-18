@@ -1,0 +1,41 @@
+classDiagram
+    class App {
+        +router: Router
+        +state: AppState
+        +render()
+    }
+    
+    class NetworkVisualization {
+        +scene: THREE.Scene
+        +camera: THREE.Camera
+        +renderer: THREE.WebGLRenderer
+        +graph: GraphData
+        +render()
+        +update()
+    }
+
+    class ControlPanel {
+        +filters: Filters
+        +settings: Settings
+        +updateGraph()
+    }
+
+    class NetworkMetrics {
+        +statistics: Stats
+        +communities: Communities
+        +calculateMetrics()
+    }
+
+    class DataManager {
+        +fetchData()
+        +processData()
+        +updateCache()
+    }
+
+    App --> NetworkVisualization
+    App --> ControlPanel
+    App --> NetworkMetrics
+    App --> DataManager
+    NetworkVisualization --> DataManager
+    ControlPanel --> DataManager
+    NetworkMetrics --> DataManager

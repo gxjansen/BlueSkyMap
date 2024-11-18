@@ -1,0 +1,41 @@
+flowchart TB
+    subgraph Frontend["Frontend (Netlify)"]
+        UI[User Interface]
+        State[State Management]
+        Viz[3D Visualization]
+        APIClient[API Client]
+    end
+
+    subgraph Backend["Backend (Node.js)"]
+        API[API Server]
+        Auth[Auth Handler]
+        JobManager[Job Manager]
+        
+        subgraph Queue["Queue System (Bull + Redis)"]
+            JobQueue[Job Queue]
+            Workers[Worker Processes]
+        end
+    end
+
+    subgraph Storage["Data Storage"]
+        MongoDB[(MongoDB)]
+        Redis[(Redis Cache)]
+    end
+
+    subgraph External["External Services"]
+        ATProtocol[AT Protocol]
+        Analytics[Analytics]
+    end
+
+    UI --> State
+    State --> Viz
+    State --> APIClient
+    APIClient --> API
+    API --> Auth
+    API --> JobManager
+    JobManager --> JobQueue
+    JobQueue --> Workers
+    Workers --> ATProtocol
+    Workers --> MongoDB
+    API --> Redis
+    Workers --> Redis
