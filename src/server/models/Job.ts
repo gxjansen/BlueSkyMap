@@ -1,88 +1,136 @@
-import mongoose from 'mongoose';
+import mongoose, { Document, Schema } from 'mongoose';
+import { AnalysisProgress } from '../../shared/types';
 
 export enum JobType {
-  NETWORK_ANALYSIS = 'networkAnalysis'
+  NETWORK_ANALYSIS = 'network_analysis'
 }
 
 export enum JobStatus {
   PENDING = 'pending',
-  PROCESSING = 'processing',
+  IN_PROGRESS = 'in_progress',
   COMPLETED = 'completed',
   FAILED = 'failed',
-  RATE_LIMITED = 'rateLimited'
+  RATE_LIMITED = 'rate_limited'
 }
 
-export interface JobProgress {
-  stage: string;
-  current: number;
-  total: number;
-  message: string;
-}
-
-// Constants
 export const QUEUE_LIMITS = {
-  MAX_CONCURRENT_JOBS: 10,
   DAILY_REFRESH_LIMIT: 5,
   PRIORITY_HANDLE: 'gui.do',
-  REFRESH_RESET_HOUR_UTC: 0 // Midnight UTC
+  MAX_CONCURRENT_JOBS: 10,
+  MAX_ATTEMPTS: 3
 };
 
-// Utility functions
-function getJobUpdateQuery() {
-  return {
-    $set: {
-      status: JobStatus.PROCESSING,
-      startedAt: new Date()
-    },
-    $inc: { attempts: 1 }
-  };
+interface IJob {
+  type: JobType;
+  userId: string;
+  handle: string;
+  status: JobStatus;
+  data: any;
+  error?: string;
+  priority: number;
+  progress?: AnalysisProgress;
+  attempts: number;
+  maxAttempts: number;
+  nextAttempt?: Date;
+  refreshCount: number;
+  estimatedWaitTime?: number;
+  startedAt?: Date;
+  completedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
-const jobSchema = new mongoose.Schema({
-  userId: {
+export interface JobDocument extends Document, IJob {
+  _id: Schema.Types.ObjectId;
+  updateProgress: (progress: AnalysisProgress) => Promise<void>;
+  incrementRefreshCount: () => Promise<void>;
+  complete: () => Promise<void>;
+  fail: (error: string) => Promise<void>;
+}
+
+const jobSchema = new Schema<JobDocument>({
+  type: {
     type: String,
     required: true,
-    index: true
+    enum: {
+      values: Object.values(JobType),
+      message: '{VALUE} is not a valid job type'
+    }
+  },
+  userId: {
+    type: String,
+    required: true
   },
   handle: {
     type: String,
-    required: true,
-    index: true
-  },
-  type: {
-    type: String,
-    enum: Object.values(JobType),
-    required: true,
-    index: true
+    required: true
   },
   status: {
     type: String,
     enum: Object.values(JobStatus),
-    default: JobStatus.PENDING,
-    required: true,
-    index: true
-  },
-  priority: {
-    type: Number,
-    default: 0,
-    index: true
-  },
-  progress: {
-    stage: String,
-    current: Number,
-    total: Number,
-    message: String
+    default: JobStatus.PENDING
   },
   data: {
-    type: mongoose.Schema.Types.Mixed,
-    required: true
+    type: Schema.Types.Mixed,
+    default: {}
   },
-  startedAt: Date,
-  completedAt: Date,
   error: String,
-  result: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Result'
+  priority: {
+    type: Number,
+    default: 0
+  },
+  progress: {
+    type: {
+      stage: {
+        type: String,
+        required: true,
+        default: 'initializing'
+      },
+      current: {
+        type: Number,
+        required: true,
+        default: 0
+      },
+      total: {
+        type: Number,
+        required: true,
+        default: 4
+      },
+      message: {
+        type: String,
+        required: true,
+        default: 'Starting network analysis'
+      },
+      details: {
+        processedNodes: {
+          type: Number,
+          required: true,
+          default: 0
+        },
+        processedEdges: {
+          type: Number,
+          required: true,
+          default: 0
+        },
+        discoveredCommunities: {
+          type: Number,
+          required: true,
+          default: 0
+        }
+      }
+    },
+    required: true,
+    default: {
+      stage: 'initializing',
+      current: 0,
+      total: 4,
+      message: 'Starting network analysis',
+      details: {
+        processedNodes: 0,
+        processedEdges: 0,
+        discoveredCommunities: 0
+      }
+    }
   },
   attempts: {
     type: Number,
@@ -90,166 +138,98 @@ const jobSchema = new mongoose.Schema({
   },
   maxAttempts: {
     type: Number,
-    default: 3
+    default: QUEUE_LIMITS.MAX_ATTEMPTS
   },
   nextAttempt: Date,
-  estimatedWaitTime: Number,
   refreshCount: {
     type: Number,
     default: 0
   },
-  lastRefreshDate: {
+  estimatedWaitTime: Number,
+  startedAt: Date,
+  completedAt: Date,
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
     type: Date,
     default: Date.now
   }
-}, {
-  timestamps: true
 });
 
-// Indexes
-jobSchema.index({ status: 1, priority: -1, createdAt: 1 });
-jobSchema.index({ userId: 1, type: 1, status: 1 });
-jobSchema.index({ handle: 1, lastRefreshDate: 1 });
-jobSchema.index({ completedAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 }); // Remove completed jobs after 7 days
+// Add index for finding jobs by handle and status
+jobSchema.index({ handle: 1, status: 1 });
 
-// Instance methods
-jobSchema.methods.updateProgress = async function(progress: Partial<JobProgress>) {
-  this.progress = { ...this.progress, ...progress };
-  return this.save();
+// Add index for finding jobs by userId and date
+jobSchema.index({ userId: 1, createdAt: -1 });
+
+// Add method to update progress
+jobSchema.methods.updateProgress = async function(progress: AnalysisProgress) {
+  console.log(`[Job] Updating progress for job ${this._id}`);
+  console.log('- Current progress:', this.progress);
+  console.log('- New progress:', progress);
+
+  // Ensure all required fields are present with defaults if not provided
+  this.progress = {
+    stage: progress.stage || 'initializing',
+    current: progress.current || 0,
+    total: progress.total || 4,
+    message: progress.message || 'Processing',
+    details: {
+      processedNodes: progress.details?.processedNodes || 0,
+      processedEdges: progress.details?.processedEdges || 0,
+      discoveredCommunities: progress.details?.discoveredCommunities || 0
+    }
+  };
+
+  // Mark the progress field as modified to ensure mongoose saves it
+  this.markModified('progress');
+  
+  // Save the document
+  await this.save();
+  
+  console.log(`[Job] Progress updated successfully`);
+  console.log('- Updated progress:', this.progress);
 };
 
+// Add method to increment refresh count
+jobSchema.methods.incrementRefreshCount = async function() {
+  console.log(`[Job] Incrementing refresh count for job ${this._id}`);
+  console.log('- Current count:', this.refreshCount);
+  
+  this.refreshCount = (this.refreshCount || 0) + 1;
+  await this.save();
+  
+  console.log('- New count:', this.refreshCount);
+};
+
+// Add method to complete job
+jobSchema.methods.complete = async function() {
+  console.log(`[Job] Completing job ${this._id}`);
+  console.log('- Current status:', this.status);
+  
+  this.status = JobStatus.COMPLETED;
+  this.completedAt = new Date();
+  await this.save();
+  
+  console.log('- Job completed successfully');
+};
+
+// Add method to fail job
 jobSchema.methods.fail = async function(error: string) {
+  console.log(`[Job] Failing job ${this._id}`);
+  console.log('- Current status:', this.status);
+  console.log('- Error:', error);
+  
   this.status = JobStatus.FAILED;
   this.error = error;
   this.completedAt = new Date();
-  return this.save();
+  await this.save();
+  
+  console.log('- Job marked as failed');
 };
 
-jobSchema.methods.complete = async function(resultId?: mongoose.Types.ObjectId) {
-  this.status = JobStatus.COMPLETED;
-  this.completedAt = new Date();
-  if (resultId) {
-    this.result = resultId;
-  }
-  return this.save();
-};
+const Job = mongoose.model<JobDocument>('Job', jobSchema);
 
-jobSchema.methods.incrementRefreshCount = async function() {
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
-
-  if (this.lastRefreshDate < today) {
-    // Reset counter if last refresh was before today
-    this.refreshCount = 1;
-  } else {
-    this.refreshCount += 1;
-  }
-
-  this.lastRefreshDate = new Date();
-  return this.save();
-};
-
-// Static methods
-jobSchema.statics.findNextJob = async function() {
-  // Get current number of processing jobs
-  const processingCount = await this.countDocuments({
-    status: JobStatus.PROCESSING
-  });
-
-  if (processingCount >= QUEUE_LIMITS.MAX_CONCURRENT_JOBS) {
-    return null;
-  }
-
-  // First try to find priority jobs
-  let nextJob = await this.findOneAndUpdate(
-    {
-      status: JobStatus.PENDING,
-      handle: QUEUE_LIMITS.PRIORITY_HANDLE
-    },
-    getJobUpdateQuery(),
-    { sort: { createdAt: 1 }, new: true }
-  );
-
-  if (!nextJob) {
-    // Then try to find regular jobs within refresh limits
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
-
-    nextJob = await this.findOneAndUpdate(
-      {
-        status: JobStatus.PENDING,
-        handle: { $ne: QUEUE_LIMITS.PRIORITY_HANDLE },
-        $or: [
-          // First time analysis
-          { refreshCount: { $exists: false } },
-          // Within daily limit
-          {
-            lastRefreshDate: { $gte: today },
-            refreshCount: { $lt: QUEUE_LIMITS.DAILY_REFRESH_LIMIT }
-          },
-          // New day reset counter
-          { lastRefreshDate: { $lt: today } }
-        ]
-      },
-      getJobUpdateQuery(),
-      { sort: { priority: -1, createdAt: 1 }, new: true }
-    );
-  }
-
-  return nextJob;
-};
-
-jobSchema.statics.updateWaitTimes = async function() {
-  const processingCount = await this.countDocuments({
-    status: JobStatus.PROCESSING
-  });
-
-  const availableSlots = Math.max(0, QUEUE_LIMITS.MAX_CONCURRENT_JOBS - processingCount);
-  if (availableSlots === 0) {
-    const avgProcessingTime = 5 * 60 * 1000; // 5 minutes as default
-    const pendingJobs = await this.find({ status: JobStatus.PENDING })
-      .sort({ priority: -1, createdAt: 1 });
-
-    for (let i = 0; i < pendingJobs.length; i++) {
-      const position = i + 1;
-      const estimatedSlot = Math.ceil(position / QUEUE_LIMITS.MAX_CONCURRENT_JOBS);
-      pendingJobs[i].estimatedWaitTime = estimatedSlot * avgProcessingTime;
-      await pendingJobs[i].save();
-    }
-  }
-};
-
-export interface JobDocument extends mongoose.Document {
-  userId: string;
-  handle: string;
-  type: JobType;
-  status: JobStatus;
-  priority: number;
-  progress?: JobProgress;
-  data: any;
-  startedAt?: Date;
-  completedAt?: Date;
-  error?: string;
-  result?: mongoose.Types.ObjectId;
-  attempts: number;
-  maxAttempts: number;
-  nextAttempt?: Date;
-  estimatedWaitTime?: number;
-  refreshCount: number;
-  lastRefreshDate: Date;
-  createdAt: Date;
-  updatedAt: Date;
-
-  updateProgress(progress: Partial<JobProgress>): Promise<JobDocument>;
-  fail(error: string): Promise<JobDocument>;
-  complete(resultId?: mongoose.Types.ObjectId): Promise<JobDocument>;
-  incrementRefreshCount(): Promise<JobDocument>;
-}
-
-export interface JobModel extends mongoose.Model<JobDocument> {
-  findNextJob(): Promise<JobDocument | null>;
-  updateWaitTimes(): Promise<void>;
-}
-
-const Job = mongoose.model<JobDocument, JobModel>('Job', jobSchema);
 export default Job;

@@ -14,26 +14,95 @@ import {
   isCacheValid,
   UserProfileCacheDocument,
   ConnectionCacheDocument,
-  NetworkAnalysisDocument
+  NetworkAnalysisDocument,
+  GenericCache
 } from '../models/Cache';
-import atprotoService from './atproto';
+import atprotoService from './atproto/index';
+import { requestQueue } from '../utils/requestQueue';
+import { BskyProfile, BskyFollower } from './atproto/interfaces';
 
 class CacheService {
   /**
-   * Get user profile with caching
+   * Generic cache get method
+   */
+  async get<T>(key: string): Promise<T | null> {
+    console.log(`[CacheService] Getting cache for key: ${key}`);
+    const cached = await GenericCache.findOne({ _id: key });
+    
+    if (!cached) {
+      console.log(`[CacheService] No cache found for ${key}`);
+      return null;
+    }
+
+    const isValid = isCacheValid(cached.lastUpdated, cached.duration);
+    console.log(`[CacheService] Cache found for ${key}`);
+    console.log(`- Last updated: ${cached.lastUpdated}`);
+    console.log(`- Valid: ${isValid}`);
+    
+    if (!isValid) {
+      console.log(`[CacheService] Cache expired for ${key}`);
+      return null;
+    }
+
+    return cached.data as T;
+  }
+
+  /**
+   * Generic cache set method
+   */
+  async set<T>(
+    key: string,
+    data: T,
+    options: CacheOptions = { duration: CACHE_DURATIONS.SHORT_TERM }
+  ): Promise<void> {
+    console.log(`[CacheService] Setting cache for key: ${key}`);
+    console.log(`- Duration: ${options.duration}ms`);
+    
+    await GenericCache.findOneAndUpdate(
+      { _id: key },
+      {
+        _id: key,
+        data,
+        lastUpdated: new Date(),
+        expiresAt: createCacheExpiration(options.duration),
+        duration: options.duration
+      },
+      { upsert: true }
+    );
+    
+    console.log(`[CacheService] Cache updated for ${key}`);
+  }
+
+  /**
+   * Get user profile with caching and rate limiting
    */
   async getUserProfile(
     handle: string,
     options: CacheOptions = { duration: CACHE_DURATIONS.SHORT_TERM }
   ): Promise<UserProfile> {
+    console.log(`[CacheService] Getting user profile for ${handle}`);
+    
     // Check cache first
     const cached = await UserProfileCache.findOne({ handle });
-    if (cached && !options.force && isCacheValid(cached.lastUpdated, options.duration)) {
-      return cached.data;
+    const isValid = cached && !options.force && isCacheValid(cached.lastUpdated, options.duration);
+
+    if (cached) {
+      console.log(`[CacheService] Cache found for profile ${handle}`);
+      console.log(`- Last updated: ${cached.lastUpdated}`);
+      console.log(`- Valid: ${isValid}`);
+      console.log(`- Force: ${options.force}`);
+      
+      if (isValid) {
+        return cached.data;
+      }
+      console.log(`[CacheService] Cache invalid, fetching fresh data`);
     }
 
-    // Fetch fresh data
-    const profile = await atprotoService.getProfile(handle);
+    // Fetch fresh data with rate limiting
+    console.log(`[CacheService] Fetching fresh profile data for ${handle}`);
+    const profile = await requestQueue.queueRequest(() => 
+      atprotoService.getProfile(handle)
+    ) as BskyProfile;
     
     // Update cache
     await UserProfileCache.findOneAndUpdate(
@@ -47,18 +116,31 @@ class CacheService {
       },
       { upsert: true, new: true }
     );
+    
+    console.log(`[CacheService] Profile cache updated for ${handle}`);
 
-    return profile;
+    return {
+      did: profile.did,
+      handle: profile.handle,
+      displayName: profile.displayName || profile.handle,
+      avatar: profile.avatar || '',
+      followersCount: profile.followersCount,
+      followingCount: profile.followsCount,
+      postsCount: profile.postsCount,
+      indexedAt: profile.indexedAt,
+    };
   }
 
   /**
-   * Get user connections with caching
+   * Get user connections with caching and rate limiting
    */
   async getUserConnections(
     handle: string,
     type: 'follower' | 'following',
     options: CacheOptions = { duration: CACHE_DURATIONS.SHORT_TERM }
   ): Promise<ConnectionData[]> {
+    console.log(`[CacheService] Getting ${type}s for ${handle}`);
+    
     const userId = await this.resolveHandleToDid(handle);
     
     // Check cache first
@@ -67,15 +149,31 @@ class CacheService {
       'connectionData.type': type,
     }).sort({ lastUpdated: -1 });
 
-    if (cached.length > 0 && !options.force && 
-        isCacheValid(cached[0].lastUpdated, options.duration)) {
-      return cached.map(c => c.connectionData);
+    const isValid = cached.length > 0 && !options.force && 
+                   isCacheValid(cached[0].lastUpdated, options.duration);
+
+    if (cached.length > 0) {
+      console.log(`[CacheService] Cache found for ${type}s of ${handle}`);
+      console.log(`- Count: ${cached.length}`);
+      console.log(`- Last updated: ${cached[0].lastUpdated}`);
+      console.log(`- Valid: ${isValid}`);
+      console.log(`- Force: ${options.force}`);
+      
+      if (isValid) {
+        return cached.map(c => c.connectionData);
+      }
+      console.log(`[CacheService] Cache invalid, fetching fresh data`);
     }
 
-    // Fetch fresh data
-    const connections = type === 'follower' 
-      ? await atprotoService.getFollowers(handle)
-      : await atprotoService.getFollowing(handle);
+    // Fetch fresh data with rate limiting
+    console.log(`[CacheService] Fetching fresh ${type}s data for ${handle}`);
+    const connections = await requestQueue.queueRequest(() =>
+      type === 'follower' 
+        ? atprotoService.getFollowers(handle)
+        : atprotoService.getFollowing(handle)
+    ) as BskyFollower[];
+
+    console.log(`[CacheService] Fetched ${connections.length} ${type}s`);
 
     // Process and cache connections
     const connectionData: ConnectionData[] = [];
@@ -89,10 +187,10 @@ class CacheService {
         did: connection.did,
         handle: connection.handle,
         displayName: connection.displayName || connection.handle,
-        avatar: connection.avatar,
-        followersCount: 0, // We don't have this info from the connection
-        followingCount: 0, // We don't have this info from the connection
-        postsCount: 0, // We don't have this info from the connection
+        avatar: connection.avatar || '',
+        followersCount: connection.followersCount || 0,
+        followingCount: connection.followingCount || 0,
+        postsCount: connection.postsCount || 0,
         indexedAt: new Date().toISOString(),
       };
 
@@ -118,31 +216,37 @@ class CacheService {
       connectionData.push(data);
     }
 
+    console.log(`[CacheService] Updated cache for ${connectionData.length} ${type}s`);
     return connectionData;
   }
 
   /**
-   * Get mutual connections
+   * Get mutual connections with caching
    */
   async getMutualConnections(
-    handle: string,
+    userId: string,
     options: CacheOptions = { duration: CACHE_DURATIONS.MEDIUM_TERM }
-  ): Promise<ConnectionData[]> {
-    const [followers, following] = await Promise.all([
-      this.getUserConnections(handle, 'follower', options),
-      this.getUserConnections(handle, 'following', options),
-    ]);
+  ): Promise<NetworkAnalysisResult | null> {
+    console.log(`[CacheService] Getting mutual connections for ${userId}`);
+    
+    const cached = await NetworkAnalysis.findOne({ userId });
+    const isValid = cached && !options.force && isCacheValid(cached.lastUpdated, options.duration);
 
-    const mutuals = followers.filter(follower =>
-      follower?.connectionId && following.some(follow => 
-        follow?.connectionId && follow.connectionId === follower.connectionId
-      )
-    );
-
-    return mutuals.map(mutual => ({
-      ...mutual,
-      type: 'mutual' as ConnectionType,
-    }));
+    if (cached) {
+      console.log(`[CacheService] Cache found for mutual connections`);
+      console.log(`- Last updated: ${cached.lastUpdated}`);
+      console.log(`- Valid: ${isValid}`);
+      console.log(`- Force: ${options.force}`);
+      
+      if (isValid) {
+        return this.convertToAnalysisResult(cached);
+      }
+      console.log(`[CacheService] Cache invalid, returning null for fresh analysis`);
+    } else {
+      console.log(`[CacheService] No cached mutual connections found`);
+    }
+    
+    return null;
   }
 
   /**
@@ -152,6 +256,10 @@ class CacheService {
     analysis: NetworkAnalysisResult,
     options: CacheOptions = { duration: CACHE_DURATIONS.LONG_TERM }
   ): Promise<NetworkAnalysisResult> {
+    console.log(`[CacheService] Storing network analysis for ${analysis.handle}`);
+    console.log(`- Stats:`, analysis.stats);
+    console.log(`- Communities: ${analysis.communities.length}`);
+    
     await NetworkAnalysis.findOneAndUpdate(
       { userId: analysis.userId },
       {
@@ -161,7 +269,8 @@ class CacheService {
       },
       { upsert: true, new: true }
     );
-
+    
+    console.log(`[CacheService] Network analysis stored successfully`);
     return analysis;
   }
 
@@ -172,15 +281,28 @@ class CacheService {
     handle: string,
     options: CacheOptions = { duration: CACHE_DURATIONS.LONG_TERM }
   ): Promise<NetworkAnalysisResult> {
+    console.log(`[CacheService] Getting network analysis for ${handle}`);
+    
     const userId = await this.resolveHandleToDid(handle);
 
     // Check cache first
     const cached = await NetworkAnalysis.findOne({ userId });
-    if (cached && !options.force && isCacheValid(cached.lastUpdated, options.duration)) {
-      return this.convertToAnalysisResult(cached);
+    const isValid = cached && !options.force && isCacheValid(cached.lastUpdated, options.duration);
+
+    if (cached) {
+      console.log(`[CacheService] Cache found for network analysis`);
+      console.log(`- Last updated: ${cached.lastUpdated}`);
+      console.log(`- Valid: ${isValid}`);
+      console.log(`- Force: ${options.force}`);
+      
+      if (isValid) {
+        return this.convertToAnalysisResult(cached);
+      }
+      console.log(`[CacheService] Cache invalid, returning empty analysis`);
     }
 
     // If not in cache or forced refresh, return basic structure
+    console.log(`[CacheService] Returning empty network analysis for ${handle}`);
     return {
       userId,
       handle,
@@ -208,28 +330,43 @@ class CacheService {
   }
 
   /**
-   * Resolve handle to DID with caching
+   * Resolve handle to DID with caching and rate limiting
    */
   private async resolveHandleToDid(handle: string): Promise<string> {
+    console.log(`[CacheService] Resolving handle to DID: ${handle}`);
+    
     const cached = await UserProfileCache.findOne({ handle });
     if (cached) {
+      console.log(`[CacheService] Found cached DID for ${handle}: ${cached._id}`);
       return cached._id;
     }
 
-    const did = await atprotoService.resolveDid(handle);
-    return did;
+    // Fetch profile to get DID
+    console.log(`[CacheService] Fetching profile to get DID for ${handle}`);
+    const profile = await this.getUserProfile(handle);
+    console.log(`[CacheService] Resolved ${handle} to DID: ${profile.did}`);
+    return profile.did;
   }
 
   /**
    * Clean expired cache entries
    */
   async cleanExpiredCache(): Promise<void> {
+    console.log(`[CacheService] Cleaning expired cache entries`);
     const now = new Date();
-    await Promise.all([
+    
+    const [profiles, connections, analyses, generic] = await Promise.all([
       UserProfileCache.deleteMany({ expiresAt: { $lt: now } }),
       ConnectionCache.deleteMany({ expiresAt: { $lt: now } }),
       NetworkAnalysis.deleteMany({ expiresAt: { $lt: now } }),
+      GenericCache.deleteMany({ expiresAt: { $lt: now } }),
     ]);
+    
+    console.log(`[CacheService] Cleaned expired cache entries:`);
+    console.log(`- Profiles: ${profiles.deletedCount}`);
+    console.log(`- Connections: ${connections.deletedCount}`);
+    console.log(`- Analyses: ${analyses.deletedCount}`);
+    console.log(`- Generic: ${generic.deletedCount}`);
   }
 }
 

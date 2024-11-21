@@ -1,233 +1,183 @@
-import { Router } from 'express';
-import type { Request, Response } from 'express';
-import { rateLimiterMiddleware } from '../middleware/rateLimiter';
-import { JobType, JobStatus, QUEUE_LIMITS } from '../models/Job';
+import networkAnalyzer from '../services/network';
 import jobProcessor from '../services/jobProcessor';
-import cacheService from '../services/cacheService';
-import atprotoService from '../services/atproto';
-import { CACHE_DURATIONS } from '../models/Cache';
-import { ConnectionType } from '../../shared/types';
+import Job, { JobStatus, JobType } from '../models/Job';
+import { Router, Request, Response } from 'express';
+import progressTracker from '../services/network/progressTracker';
+import { UserProfileCache, ConnectionCache, NetworkAnalysis } from '../models/Cache';
 
 const router = Router();
 
-// Apply rate limiting to all network routes
-router.use(rateLimiterMiddleware);
+/**
+ * Clear Cache Endpoint
+ * Matches client's expected API route: /api/network/clear-cache/:handle
+ */
+router.post('/clear-cache/:handle', async (req: Request, res: Response) => {
+  try {
+    const { handle } = req.params;
+    console.log(`[NetworkRoute] Clearing cache for handle: ${handle}`);
+
+    // Clear all related caches
+    await Promise.all([
+      UserProfileCache.deleteMany({ handle }),
+      ConnectionCache.deleteMany({ userId: { $regex: handle } }),
+      NetworkAnalysis.deleteMany({ handle })
+    ]);
+
+    console.log(`[NetworkRoute] Cache cleared successfully for ${handle}`);
+    res.status(200).json({ message: 'Cache cleared successfully' });
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error 
+      ? error.message 
+      : 'An unknown error occurred while clearing cache';
+    
+    console.error(`[NetworkRoute] Cache clearing error: ${errorMessage}`);
+    res.status(500).json({ error: errorMessage });
+  }
+});
 
 /**
- * POST /api/network/analyze/:handle
- * Start a network analysis job
+ * Network Analysis Job Endpoint
+ * Matches client's expected API route: /api/network/analyze/:handle
  */
 router.post('/analyze/:handle', async (req: Request, res: Response) => {
   try {
     const { handle } = req.params;
     const { force = false } = req.body;
 
-    // Ensure AT Protocol service is authenticated
-    if (!atprotoService.isAuthenticated()) {
-      await atprotoService.initialize();
+    console.log(`[NetworkRoute] Received job creation request for handle: ${handle}, force: ${force}`);
+
+    if (!handle) {
+      console.error('[NetworkRoute] Handle is required');
+      return res.status(400).json({ error: 'Handle is required' });
     }
 
-    // Use the authenticated user's credentials
-    const userId = process.env.BSKY_IDENTIFIER?.split('.')[0] || 'default';
-
-    // Check if we have a recent analysis
-    if (!force) {
-      const cached = await cacheService.getNetworkAnalysis(handle, {
-        duration: CACHE_DURATIONS.LONG_TERM,
-        force: false,
-      });
-      
-      if (cached) {
-        return res.json(cached);
-      }
-    }
-
-    // Get current refresh count
-    const refreshCount = await jobProcessor.getUserRefreshCount(handle);
-    if (handle !== QUEUE_LIMITS.PRIORITY_HANDLE && 
-        refreshCount >= QUEUE_LIMITS.DAILY_REFRESH_LIMIT) {
-      return res.status(429).json({
-        error: 'Rate Limited',
-        message: 'Daily refresh limit exceeded',
-        limit: QUEUE_LIMITS.DAILY_REFRESH_LIMIT,
-        resetAt: new Date().setUTCHours(24, 0, 0, 0),
+    // Check for existing job
+    const existingJob = await jobProcessor.getCurrentJob(handle);
+    if (existingJob && !force) {
+      console.log(`[NetworkRoute] Using existing job: ${existingJob._id}`);
+      return res.status(202).json({
+        message: 'Network analysis job already in progress',
+        jobId: existingJob._id.toString()
       });
     }
 
-    // Create analysis job
-    const job = await jobProcessor.createJob(
+    // Reset any existing jobs for this handle to allow reprocessing
+    if (existingJob) {
+      console.log(`[NetworkRoute] Resetting existing job for reprocessing`);
+      existingJob.status = JobStatus.PENDING;
+      existingJob.attempts = 0;
+      existingJob.progress = progressTracker.createInitialProgress();
+      await existingJob.save();
+    }
+
+    // Create a new job if none exists
+    const job = existingJob || await jobProcessor.createJob(
       JobType.NETWORK_ANALYSIS,
-      userId,
+      'system', // placeholder userId
       handle,
       { force },
-      1 // High priority
+      force ? 1 : 0 // Higher priority for force updates
     );
 
-    // If job was rate limited, return appropriate response
-    if (job.status === JobStatus.RATE_LIMITED) {
-      return res.status(429).json({
-        error: 'Rate Limited',
-        message: job.error,
-        limit: QUEUE_LIMITS.DAILY_REFRESH_LIMIT,
-        resetAt: new Date().setUTCHours(24, 0, 0, 0),
-      });
-    }
+    console.log(`[NetworkRoute] Job ${job._id} ready for processing`);
+    console.log(`- Status: ${job.status}`);
+    console.log(`- Force: ${force}`);
+    console.log(`- Handle: ${handle}`);
 
+    // Return response
     res.status(202).json({
-      message: 'Network analysis started',
-      jobId: job._id,
-      status: job.status,
-      estimatedWaitTime: job.estimatedWaitTime,
-      refreshesRemaining: QUEUE_LIMITS.DAILY_REFRESH_LIMIT - (refreshCount + 1),
+      message: 'Network analysis job started',
+      jobId: job._id.toString()
     });
-  } catch (error) {
-    console.error('Error starting network analysis:', error);
-    res.status(500).json({ 
-      error: 'Failed to start network analysis',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
+
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error 
+      ? error.message 
+      : 'An unknown error occurred during network analysis job creation';
+    
+    console.error(`[NetworkRoute] Network analysis job creation error: ${errorMessage}`);
+    res.status(500).json({ error: errorMessage });
   }
 });
 
 /**
- * GET /api/network/profile/:handle
- * Get user profile with connections summary
- */
-router.get('/profile/:handle', async (req: Request, res: Response) => {
-  try {
-    const { handle } = req.params;
-    const { force } = req.query;
-
-    // Ensure AT Protocol service is authenticated
-    if (!atprotoService.isAuthenticated()) {
-      await atprotoService.initialize();
-    }
-
-    const [profile, analysis] = await Promise.all([
-      cacheService.getUserProfile(handle, {
-        duration: CACHE_DURATIONS.SHORT_TERM,
-        force: force === 'true',
-      }),
-      cacheService.getNetworkAnalysis(handle, {
-        duration: CACHE_DURATIONS.LONG_TERM,
-        force: force === 'true',
-      }),
-    ]);
-
-    // Get refresh count
-    const refreshCount = await jobProcessor.getUserRefreshCount(handle);
-
-    res.json({
-      profile,
-      stats: analysis.stats,
-      lastUpdated: analysis.lastUpdated,
-      refreshes: {
-        used: refreshCount,
-        remaining: QUEUE_LIMITS.DAILY_REFRESH_LIMIT - refreshCount,
-        limit: QUEUE_LIMITS.DAILY_REFRESH_LIMIT,
-        resetAt: new Date().setUTCHours(24, 0, 0, 0),
-      },
-    });
-  } catch (error) {
-    console.error('Error fetching network profile:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch network profile',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
-  }
-});
-
-/**
- * GET /api/network/connections/:handle
- * Get user connections with optional filtering
- */
-router.get('/connections/:handle', async (req: Request, res: Response) => {
-  try {
-    const { handle } = req.params;
-    const { type = 'all', force } = req.query;
-
-    // Ensure AT Protocol service is authenticated
-    if (!atprotoService.isAuthenticated()) {
-      await atprotoService.initialize();
-    }
-
-    const options = {
-      duration: CACHE_DURATIONS.SHORT_TERM,
-      force: force === 'true',
-    };
-
-    let connections;
-    switch (type) {
-      case 'follower':
-        connections = await cacheService.getUserConnections(handle, 'follower', options);
-        break;
-      case 'following':
-        connections = await cacheService.getUserConnections(handle, 'following', options);
-        break;
-      case 'mutual':
-        connections = await cacheService.getMutualConnections(handle, options);
-        break;
-      case 'all':
-      default:
-        const [followers, following, mutuals] = await Promise.all([
-          cacheService.getUserConnections(handle, 'follower', options),
-          cacheService.getUserConnections(handle, 'following', options),
-          cacheService.getMutualConnections(handle, options),
-        ]);
-        connections = {
-          followers,
-          following,
-          mutuals,
-        };
-    }
-
-    res.json(connections);
-  } catch (error) {
-    console.error('Error fetching connections:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch connections',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
-  }
-});
-
-/**
- * GET /api/network/analysis/:handle
- * Get network analysis results
+ * Job Status Endpoint
+ * Matches client's expected API route: /api/network/analysis/:handle
  */
 router.get('/analysis/:handle', async (req: Request, res: Response) => {
   try {
     const { handle } = req.params;
-    const { force } = req.query;
+    console.log(`[NetworkRoute] Received job status request for handle: ${handle}`);
 
-    // Ensure AT Protocol service is authenticated
-    if (!atprotoService.isAuthenticated()) {
-      await atprotoService.initialize();
+    const job = await jobProcessor.getCurrentJob(handle);
+    console.log(`[NetworkRoute] Current job:`, job ? {
+      id: job._id,
+      status: job.status,
+      progress: job.progress
+    } : 'No current job');
+
+    if (!job) {
+      // If no current job, try to find the most recent completed job
+      const lastCompletedJob = await Job.findOne({
+        handle,
+        status: JobStatus.COMPLETED
+      }).sort({ updatedAt: -1 });
+
+      console.log(`[NetworkRoute] Last completed job:`, lastCompletedJob ? {
+        id: lastCompletedJob._id,
+        status: lastCompletedJob.status,
+        hasData: !!lastCompletedJob.data
+      } : 'No completed job');
+
+      if (lastCompletedJob) {
+        console.log(`[NetworkRoute] Returning completed job data`);
+        return res.json(lastCompletedJob.data);
+      }
+
+      console.log(`[NetworkRoute] No job found for handle`);
+      return res.status(404).json({ error: 'No job found for this handle' });
     }
 
-    const analysis = await cacheService.getNetworkAnalysis(handle, {
-      duration: CACHE_DURATIONS.LONG_TERM,
-      force: force === 'true',
+    // If job is complete, return full network data
+    if (job.status === JobStatus.COMPLETED && job.data) {
+      console.log(`[NetworkRoute] Job is completed, returning job data`);
+      return res.json(job.data);
+    }
+
+    // Get the latest progress, either from job document or create initial progress
+    const progress = job.progress || progressTracker.createInitialProgress();
+    
+    console.log(`[NetworkRoute] Returning job progress:`, {
+      stage: progress.stage,
+      current: progress.current,
+      total: progress.total,
+      details: progress.details
     });
 
-    // Get refresh count
-    const refreshCount = await jobProcessor.getUserRefreshCount(handle);
-
+    // Return progress with all details
     res.json({
-      ...analysis,
-      refreshes: {
-        used: refreshCount,
-        remaining: QUEUE_LIMITS.DAILY_REFRESH_LIMIT - refreshCount,
-        limit: QUEUE_LIMITS.DAILY_REFRESH_LIMIT,
-        resetAt: new Date().setUTCHours(24, 0, 0, 0),
-      },
+      jobId: job._id.toString(),
+      status: job.status,
+      progress: {
+        stage: progress.stage || job.status,
+        current: progress.current,
+        total: progress.total,
+        message: progress.message,
+        details: {
+          processedNodes: progress.details?.processedNodes || 0,
+          processedEdges: progress.details?.processedEdges || 0,
+          discoveredCommunities: progress.details?.discoveredCommunities || 0
+        }
+      }
     });
-  } catch (error) {
-    console.error('Error fetching network analysis:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch network analysis',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
+
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error 
+      ? error.message 
+      : 'An unknown error occurred while fetching job status';
+    
+    console.error(`[NetworkRoute] Job status retrieval error: ${errorMessage}`);
+    res.status(500).json({ error: errorMessage });
   }
 });
 

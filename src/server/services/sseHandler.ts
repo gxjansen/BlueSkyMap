@@ -1,126 +1,102 @@
-import { Response } from 'express';
-import { JobDocument } from '../models/Job';
+import { Request, Response } from 'express';
+import { EventEmitter } from 'events';
+import { JobDocument, JobStatus } from '../models/Job';
 import jobProcessor from './jobProcessor';
 
+/**
+ * Server-Sent Events Handler
+ * Manages real-time updates for job progress
+ */
 class SSEHandler {
-  private clients: Map<string, Set<Response>>;
+  private eventEmitter: EventEmitter;
+  private clients: Map<string, Response>;
 
   constructor() {
+    this.eventEmitter = new EventEmitter();
     this.clients = new Map();
-    this.setupJobProcessorListeners();
+    console.log('SSE Handler initialized');
   }
 
   /**
-   * Add a new client connection for a specific user
+   * Handle new SSE connection
    */
-  addClient(userId: string, res: Response): void {
-    // Set up SSE headers
+  handleConnection = (req: Request, res: Response) => {
+    const clientId = req.params.clientId;
+
+    // Set headers for SSE
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
+      'Connection': 'keep-alive'
     });
 
-    // Initialize heartbeat to keep connection alive
-    const heartbeat = setInterval(() => {
-      res.write('event: heartbeat\ndata: {}\n\n');
-    }, 30000);
+    // Send initial connection message
+    res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
 
-    // Clean up on client disconnect
-    res.on('close', () => {
-      clearInterval(heartbeat);
-      this.removeClient(userId, res);
+    // Store client connection
+    this.clients.set(clientId, res);
+
+    // Handle client disconnect
+    req.on('close', () => {
+      this.clients.delete(clientId);
+      console.log(`[SSEHandler] Client ${clientId} disconnected`);
     });
 
-    // Add client to the map
-    if (!this.clients.has(userId)) {
-      this.clients.set(userId, new Set());
-    }
-    this.clients.get(userId)?.add(res);
-
-    // Send initial connection confirmation
-    this.sendEventToClient(res, 'connected', { message: 'SSE connection established' });
-  }
+    console.log(`[SSEHandler] Client ${clientId} connected`);
+  };
 
   /**
-   * Remove a client connection
+   * Send update to specific client
    */
-  private removeClient(userId: string, res: Response): void {
-    const userClients = this.clients.get(userId);
-    if (userClients) {
-      userClients.delete(res);
-      if (userClients.size === 0) {
-        this.clients.delete(userId);
+  sendUpdate = (clientId: string, data: any) => {
+    const client = this.clients.get(clientId);
+    if (client) {
+      console.log(`[SSEHandler] Sending update to client ${clientId}:`, data);
+      client.write(`data: ${JSON.stringify(data)}\n\n`);
+    } else {
+      console.log(`[SSEHandler] Client ${clientId} not found for update:`, data);
+    }
+  };
+
+  /**
+   * Send update to all clients
+   */
+  broadcastUpdate = (data: any) => {
+    console.log(`[SSEHandler] Broadcasting update to ${this.clients.size} clients:`, data);
+    this.clients.forEach((client, clientId) => {
+      try {
+        client.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch (error) {
+        console.error(`[SSEHandler] Error sending update to client ${clientId}:`, error);
+        // Remove client if we can't write to it
+        this.clients.delete(clientId);
       }
-    }
-  }
+    });
+  };
 
   /**
-   * Set up listeners for job processor events
+   * Update job progress
    */
-  private setupJobProcessorListeners(): void {
-    jobProcessor.on('jobCreated', (job: JobDocument) => {
-      this.sendEventToUser(job.userId, 'jobCreated', job);
+  updateJobProgress = (jobId: string, progress: any) => {
+    console.log(`[SSEHandler] Updating job progress for ${jobId}:`, progress);
+    this.broadcastUpdate({
+      type: 'jobProgress',
+      jobId,
+      progress
     });
-
-    jobProcessor.on('jobStarted', (job: JobDocument) => {
-      this.sendEventToUser(job.userId, 'jobStarted', job);
-    });
-
-    jobProcessor.on('jobProgress', (job: JobDocument) => {
-      this.sendEventToUser(job.userId, 'jobProgress', job);
-    });
-
-    jobProcessor.on('jobCompleted', (job: JobDocument) => {
-      this.sendEventToUser(job.userId, 'jobCompleted', job);
-    });
-
-    jobProcessor.on('jobFailed', (job: JobDocument) => {
-      this.sendEventToUser(job.userId, 'jobFailed', job);
-    });
-
-    jobProcessor.on('jobRetrying', (job: JobDocument) => {
-      this.sendEventToUser(job.userId, 'jobRetrying', job);
-    });
-  }
+  };
 
   /**
-   * Send an event to all clients for a specific user
+   * Update job status
    */
-  private sendEventToUser(userId: string, event: string, data: any): void {
-    const userClients = this.clients.get(userId);
-    if (userClients) {
-      userClients.forEach(client => {
-        this.sendEventToClient(client, event, data);
-      });
-    }
-  }
-
-  /**
-   * Send an event to a specific client
-   */
-  private sendEventToClient(res: Response, event: string, data: any): void {
-    const eventData = JSON.stringify(data);
-    res.write(`event: ${event}\ndata: ${eventData}\n\n`);
-  }
-
-  /**
-   * Get the number of connected clients for a user
-   */
-  getClientCount(userId: string): number {
-    return this.clients.get(userId)?.size || 0;
-  }
-
-  /**
-   * Get total number of connected clients
-   */
-  getTotalClientCount(): number {
-    let total = 0;
-    for (const clients of this.clients.values()) {
-      total += clients.size;
-    }
-    return total;
-  }
+  updateJobStatus = (jobId: string, status: JobStatus) => {
+    console.log(`[SSEHandler] Updating job status for ${jobId}:`, status);
+    this.broadcastUpdate({
+      type: 'jobStatus',
+      jobId,
+      status
+    });
+  };
 }
 
 // Create and export singleton instance

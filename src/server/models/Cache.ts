@@ -2,6 +2,39 @@ import mongoose from 'mongoose';
 import { UserProfile, ConnectionData, NetworkAnalysisResult } from '../../shared/types';
 
 /**
+ * Generic Cache Schema
+ */
+const genericCacheSchema = new mongoose.Schema({
+  _id: {
+    type: String,
+    required: true,
+  },
+  data: {
+    type: mongoose.Schema.Types.Mixed,
+    required: true,
+  },
+  duration: {
+    type: Number,
+    required: true,
+  },
+  lastUpdated: {
+    type: Date,
+    required: true,
+    index: true,
+  },
+  expiresAt: {
+    type: Date,
+    required: true,
+    index: true,
+  },
+}, {
+  timestamps: true,
+});
+
+// Index for cache invalidation
+genericCacheSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+/**
  * User Profile Cache Schema
  */
 const userProfileCacheSchema = new mongoose.Schema({
@@ -147,6 +180,14 @@ export const CACHE_DURATIONS = {
 } as const;
 
 // Document interfaces
+export interface GenericCacheDocument extends mongoose.Document {
+  _id: string;
+  data: any;
+  duration: number;
+  lastUpdated: Date;
+  expiresAt: Date;
+}
+
 export interface UserProfileCacheDocument extends mongoose.Document {
   _id: string;
   handle: string;
@@ -186,11 +227,13 @@ export interface NetworkAnalysisDocument extends mongoose.Document {
 }
 
 // Model interfaces
+export interface GenericCacheModel extends mongoose.Model<GenericCacheDocument> {}
 export interface UserProfileCacheModel extends mongoose.Model<UserProfileCacheDocument> {}
 export interface ConnectionCacheModel extends mongoose.Model<ConnectionCacheDocument> {}
 export interface NetworkAnalysisModel extends mongoose.Model<NetworkAnalysisDocument> {}
 
 // Export models
+export const GenericCache = mongoose.model<GenericCacheDocument, GenericCacheModel>('GenericCache', genericCacheSchema);
 export const UserProfileCache = mongoose.model<UserProfileCacheDocument, UserProfileCacheModel>('UserProfileCache', userProfileCacheSchema);
 export const ConnectionCache = mongoose.model<ConnectionCacheDocument, ConnectionCacheModel>('ConnectionCache', connectionCacheSchema);
 export const NetworkAnalysis = mongoose.model<NetworkAnalysisDocument, NetworkAnalysisModel>('NetworkAnalysis', networkAnalysisSchema);

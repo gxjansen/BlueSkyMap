@@ -68,11 +68,20 @@ export interface NetworkAnalysisResult {
 }
 
 // Progress Tracking
+export type AnalysisStage = 
+  | 'initializing'
+  | 'collecting'
+  | 'analyzing'
+  | 'processing'
+  | 'completed'
+  | 'error';
+
 export interface AnalysisProgress {
-  stage: 'collecting' | 'analyzing' | 'processing';
+  stage: AnalysisStage;
   current: number;
   total: number;
-  details?: {
+  message: string;
+  details: {
     processedNodes: number;
     processedEdges: number;
     discoveredCommunities: number;
@@ -89,4 +98,10 @@ export interface CacheEntry<T> {
   data: T;
   lastUpdated: Date;
   expiresAt: Date;
+}
+
+// Network Analysis Types
+export interface MutualNetwork {
+  nodes: { id: string; handle: string }[];
+  edges: { source: string; target: string }[];
 }

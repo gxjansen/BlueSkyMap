@@ -25,13 +25,15 @@ class GraphProcessor {
     userId: string,
     followers: ConnectionData[],
     following: ConnectionData[],
-    mutuals: ConnectionData[]
+    mutuals: ConnectionData[],
+    additionalEdges?: { source: string; target: string }[]
   ): NetworkData {
     console.log('Creating graph with:', {
       userId,
       followersCount: followers?.length || 0,
       followingCount: following?.length || 0,
-      mutualsCount: mutuals?.length || 0
+      mutualsCount: mutuals?.length || 0,
+      additionalEdgesCount: additionalEdges?.length || 0
     });
 
     const nodes = new Map<string, NetworkNode>();
@@ -63,67 +65,62 @@ class GraphProcessor {
       type: 'user',
       data: {
         did: userId,
-        handle: followers?.[0]?.profile?.handle || userId,
-        displayName: followers?.[0]?.profile?.displayName || userId
+        handle: mutuals?.[0]?.profile?.handle || userId,
+        displayName: mutuals?.[0]?.profile?.displayName || userId
       }
     };
     nodes.set(userId, centralNode);
 
-    // Process followers
-    if (Array.isArray(followers)) {
-      followers.forEach(follower => {
-        if (!follower?.connectionId) {
-          console.log('Skipping follower without connectionId');
-          return;
-        }
-        addNode(follower);
-        edges.push({
-          source: follower.connectionId,
-          target: userId,
-          type: 'follows'
-        });
-      });
-    }
-
-    // Process following
-    if (Array.isArray(following)) {
-      following.forEach(follow => {
-        if (!follow?.connectionId) {
-          console.log('Skipping following without connectionId');
-          return;
-        }
-        addNode(follow);
-        edges.push({
-          source: userId,
-          target: follow.connectionId,
-          type: 'follows'
-        });
-      });
-    }
-
-    // Update mutual connections
+    // Process mutual followers
     if (Array.isArray(mutuals)) {
       mutuals.forEach(mutual => {
         if (!mutual?.connectionId) {
           console.log('Skipping mutual without connectionId');
           return;
         }
-        // Find and update the corresponding edges to mutual type
-        const incomingEdge = edges.find(e => 
-          e?.source === mutual.connectionId && e?.target === userId
-        );
-        const outgoingEdge = edges.find(e => 
-          e?.source === userId && e?.target === mutual.connectionId
-        );
+        addNode(mutual);
+      });
 
-        if (incomingEdge) incomingEdge.type = 'mutual';
-        if (outgoingEdge) outgoingEdge.type = 'mutual';
+      // Add edges only after all nodes are created
+      mutuals.forEach(mutual => {
+        if (!mutual?.connectionId || !nodes.has(mutual.connectionId)) {
+          return;
+        }
+        edges.push({
+          source: userId,
+          target: mutual.connectionId,
+          type: 'mutual'
+        });
+      });
+    }
+
+    // Add additional edges between mutual followers only if both nodes exist
+    if (additionalEdges) {
+      additionalEdges.forEach(edge => {
+        if (!edge?.source || !edge?.target) {
+          console.log('Skipping edge without source or target');
+          return;
+        }
+        if (!nodes.has(edge.source) || !nodes.has(edge.target)) {
+          console.log(`Skipping edge between non-existent nodes: ${edge.source} -> ${edge.target}`);
+          return;
+        }
+        edges.push({
+          source: edge.source,
+          target: edge.target,
+          type: 'mutual'
+        });
       });
     }
 
     const result = {
       nodes: Array.from(nodes.values()),
-      edges: edges.filter(edge => edge?.source && edge?.target) // Filter out any invalid edges
+      edges: edges.filter(edge => 
+        edge?.source && 
+        edge?.target && 
+        nodes.has(edge.source) && 
+        nodes.has(edge.target)
+      )
     };
 
     console.log('Created graph with:', {

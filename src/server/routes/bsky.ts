@@ -1,109 +1,61 @@
-import { Router } from 'express';
-import type { Request, Response } from 'express';
-import { rateLimiterMiddleware, getRateLimitStatus } from '../middleware/rateLimiter';
-import atprotoService from '../services/atproto';
+import { Router, Request, Response } from 'express';
+import { requestQueue } from '../utils/requestQueue';
+import atprotoService from '../services/atproto/index';
+import { BskyFollower, BskyProfile } from '../services/atproto/interfaces';
 
 const router = Router();
 
 /**
- * Apply rate limiting to all BlueSky routes
- */
-router.use(rateLimiterMiddleware);
-
-/**
- * GET /api/bsky/profile/:handle
- * Get profile information for a BlueSky user
+ * Get user profile
  */
 router.get('/profile/:handle', async (req: Request, res: Response) => {
   try {
-    const { handle } = req.params;
-    const profile = await atprotoService.getProfile(handle);
-    
-    // Include rate limit info in response headers
-    const rateLimitInfo = await getRateLimitStatus(req.ip || 'unknown');
-    res.set({
-      'X-RateLimit-Remaining': rateLimitInfo.remaining.toString(),
-      'X-RateLimit-Reset': rateLimitInfo.reset.toString(),
-    });
-
+    const handle = req.params.handle;
+    const profile = await requestQueue.queueRequest(() => 
+      atprotoService.getProfile(handle)
+    ) as BskyProfile;
     res.json(profile);
-  } catch (error) {
-    console.error('Error fetching profile:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch profile',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error 
+      ? error.message 
+      : 'An unknown error occurred';
+    res.status(500).json({ error: errorMessage });
   }
 });
 
 /**
- * GET /api/bsky/network/:handle
- * Get social graph data for a BlueSky user
+ * Get user followers
  */
-router.get('/network/:handle', async (req: Request, res: Response) => {
+router.get('/followers/:handle', async (req: Request, res: Response) => {
   try {
-    const { handle } = req.params;
-    
-    // Fetch followers and following lists concurrently
-    const [followers, following] = await Promise.all([
-      atprotoService.getFollowers(handle),
+    const handle = req.params.handle;
+    const followers = await requestQueue.queueRequest(() => 
+      atprotoService.getFollowers(handle)
+    ) as BskyFollower[];
+    res.json(followers);
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error 
+      ? error.message 
+      : 'An unknown error occurred';
+    res.status(500).json({ error: errorMessage });
+  }
+});
+
+/**
+ * Get user following
+ */
+router.get('/following/:handle', async (req: Request, res: Response) => {
+  try {
+    const handle = req.params.handle;
+    const following = await requestQueue.queueRequest(() => 
       atprotoService.getFollowing(handle)
-    ]);
-
-    // Find mutual connections
-    const mutuals = followers.filter(follower => 
-      following.some(follow => follow.did === follower.did)
-    );
-
-    // Include rate limit info in response headers
-    const rateLimitInfo = await getRateLimitStatus(req.ip || 'unknown');
-    res.set({
-      'X-RateLimit-Remaining': rateLimitInfo.remaining.toString(),
-      'X-RateLimit-Reset': rateLimitInfo.reset.toString(),
-    });
-
-    res.json({
-      followers,
-      following,
-      mutuals,
-      stats: {
-        followersCount: followers.length,
-        followingCount: following.length,
-        mutualsCount: mutuals.length,
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching network data:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch network data',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
-  }
-});
-
-/**
- * GET /api/bsky/resolve/:handle
- * Resolve a handle to a DID
- */
-router.get('/resolve/:handle', async (req: Request, res: Response) => {
-  try {
-    const { handle } = req.params;
-    const did = await atprotoService.resolveDid(handle);
-    
-    // Include rate limit info in response headers
-    const rateLimitInfo = await getRateLimitStatus(req.ip || 'unknown');
-    res.set({
-      'X-RateLimit-Remaining': rateLimitInfo.remaining.toString(),
-      'X-RateLimit-Reset': rateLimitInfo.reset.toString(),
-    });
-
-    res.json({ handle, did });
-  } catch (error) {
-    console.error('Error resolving handle:', error);
-    res.status(500).json({ 
-      error: 'Failed to resolve handle',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
+    ) as BskyFollower[];
+    res.json(following);
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error 
+      ? error.message 
+      : 'An unknown error occurred';
+    res.status(500).json({ error: errorMessage });
   }
 });
 

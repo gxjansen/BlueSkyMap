@@ -1,128 +1,133 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express from 'express';
 import cors from 'cors';
-import mongoose from 'mongoose';
-import dotenv from 'dotenv';
+import morgan from 'morgan';
+import { createWriteStream } from 'fs';
+import { join } from 'path';
+import { format } from 'date-fns';
 import routes from './routes';
-import jobProcessor from './services/jobProcessor';
-import atprotoService from './services/atproto';
-import networkAnalyzer from './services/networkAnalyzer';
+import sseHandler from './services/sseHandler';
 
-dotenv.config();
+// Custom error class for authentication errors
+export class AuthenticationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthenticationError';
+  }
+}
 
 const app = express();
-const port = process.env.PORT || 3001;
+
+// Create logs directory if it doesn't exist
+const logsDir = join(__dirname, '../../logs');
+try {
+  require('fs').mkdirSync(logsDir);
+} catch (err) {
+  if ((err as any).code !== 'EEXIST') {
+    console.error('Error creating logs directory:', err);
+  }
+}
+
+// Create a write stream for logging
+const accessLogStream = createWriteStream(
+  join(logsDir, `server-${format(new Date(), 'yyyy-MM-dd')}.log`),
+  { flags: 'a' }
+);
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', 'http://localhost:5176'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
-// Routes
+// Logging middleware
+morgan.token('body', (req: any) => JSON.stringify(req.body));
+app.use(morgan(':method :url :status :response-time ms - :body', { stream: accessLogStream }));
+app.use(morgan('dev')); // Console logging
+
+// Custom logging middleware for detailed request/response logging
+app.use((req, res, next) => {
+  const oldWrite = res.write;
+  const oldEnd = res.end;
+  const chunks: Buffer[] = [];
+
+  res.write = function(chunk: any) {
+    chunks.push(Buffer.from(chunk));
+    return oldWrite.apply(res, arguments as any);
+  };
+
+  res.end = function(chunk: any) {
+    if (chunk) {
+      chunks.push(Buffer.from(chunk));
+    }
+    const responseBody = Buffer.concat(chunks).toString('utf8');
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: req.body,
+      responseStatus: res.statusCode,
+      responseHeaders: res.getHeaders(),
+      responseBody: responseBody.substring(0, 1000) // Limit response body logging
+    };
+
+    accessLogStream.write(`${JSON.stringify(logEntry)}\n`);
+    return oldEnd.apply(res, arguments as any);
+  };
+
+  next();
+});
+
+// SSE endpoint
+app.get('/api/events/:clientId', sseHandler.handleConnection);
+
+// API routes
 app.use('/api', routes);
 
 // Error handling middleware
-app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error('Error:', err);
+  accessLogStream.write(`Error: ${err.stack}\n`);
+
+  // Handle authentication errors
+  if (err instanceof AuthenticationError || err.message.includes('Authentication failed')) {
+    return res.status(401).json({
+      error: 'Authentication Failed',
+      message: 'BlueSky API authentication failed. Please configure valid credentials in the server\'s .env file.',
+      details: err.message
+    });
+  }
+
+  // Handle rate limiting errors
+  if (err.message.includes('Rate Limited')) {
+    return res.status(429).json({
+      error: 'Rate Limited',
+      message: err.message
+    });
+  }
+
+  // Handle other known errors
+  if (err instanceof Error) {
+    return res.status(500).json({
+      error: err.name,
+      message: err.message
+    });
+  }
+
+  // Handle unknown errors
   res.status(500).json({
     error: 'Internal Server Error',
-    message: err.message
+    message: 'An unexpected error occurred'
   });
 });
 
-// Connect to MongoDB
-async function connectToMongoDB() {
-  try {
-    const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/bskymaps';
-    await mongoose.connect(mongoUri);
-    console.log('Successfully connected to MongoDB.');
-    return true;
-  } catch (error) {
-    console.error('Failed to connect to MongoDB:', error);
-    return false;
-  }
-}
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
-// Initialize AT Protocol service
-async function initializeATProtocol() {
-  try {
-    await atprotoService.initialize();
-    console.log('AT Protocol service initialized');
-    return true;
-  } catch (error) {
-    console.error('Failed to initialize AT Protocol service:', error);
-    return false;
-  }
-}
-
-// Initialize job processor
-function initializeJobProcessor() {
-  try {
-    // Register network analyzer
-    networkAnalyzer.registerHandler(jobProcessor);
-    console.log('Network analyzer registered for job type: networkAnalysis');
-
-    // Start job processor
-    jobProcessor.start();
-    console.log('Job processor started');
-    return true;
-  } catch (error) {
-    console.error('Failed to initialize job processor:', error);
-    return false;
-  }
-}
-
-// Start server
-async function startServer() {
-  try {
-    // Connect to MongoDB
-    const mongoConnected = await connectToMongoDB();
-    if (!mongoConnected) {
-      throw new Error('Failed to connect to MongoDB');
-    }
-    console.log('MongoDB connected successfully');
-
-    // Initialize AT Protocol service
-    const atprotoInitialized = await initializeATProtocol();
-    if (!atprotoInitialized) {
-      throw new Error('Failed to initialize AT Protocol service');
-    }
-
-    // Initialize job processor
-    const jobProcessorInitialized = initializeJobProcessor();
-    if (!jobProcessorInitialized) {
-      throw new Error('Failed to initialize job processor');
-    }
-
-    // Start Express server
-    const server = app.listen(port, () => {
-      console.log(`Server running on port ${port}`);
-    });
-
-    // Handle server errors
-    server.on('error', (error: any) => {
-      if (error.code === 'EADDRINUSE') {
-        console.error(`Port ${port} is already in use`);
-        process.exit(1);
-      } else {
-        console.error('Server error:', error);
-      }
-    });
-
-    // Handle process termination
-    process.on('SIGTERM', () => {
-      console.log('SIGTERM received. Shutting down gracefully...');
-      server.close(async () => {
-        console.log('Server closed');
-        await mongoose.connection.close();
-        console.log('MongoDB connection closed');
-        process.exit(0);
-      });
-    });
-
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
-}
-
-// Start the server
-startServer();
+export default app;
